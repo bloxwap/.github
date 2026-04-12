@@ -3,7 +3,8 @@ Real-time betting, trading, and prediction market exchange for the next generati
 <details>
 <summary>Careers</summary>
 
-## 👷 Staff Designer
+<details>
+<summary>👷 Staff Designer</summary>
 
 **Salary:** $300K + Annual Bonus + 2% Equity
 
@@ -35,9 +36,10 @@ As a Staff Designer at Bloxswap, you'll shape the future of real-time tap-tradin
 - 3D software
 - Video Editing/Animation Software
 
----
+</details>
 
-## 👷 Staff Frontend Software Engineer
+<details>
+<summary>👷 Staff Frontend Software Engineer</summary>
 
 **Salary:** $300k + Quarterly Bonus + 2% Equity
 
@@ -75,9 +77,10 @@ As a Staff Designer at Bloxswap, you'll shape the future of real-time tap-tradin
 - Cloudflare Workers, Durable Objects, WebSockets
 - Expo, React Native, or future mobile engine TBD
 
----
+</details>
 
-## 👷 Staff Backend Software Engineer
+<details>
+<summary>👷 Staff Backend Software Engineer</summary>
 
 **Salary:** $300K + Annual Bonus + 2% Equity
 
@@ -114,5 +117,7 @@ As a Staff Designer at Bloxswap, you'll shape the future of real-time tap-tradin
 - Solana, EVM, Privy, MagicBlock, Pyth
 - PostgreSQL, KV storage, Redis
 - GitHub Actions, CI/CD, Monorepo
+
+</details>
 
 </details>
