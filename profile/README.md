@@ -1,5 +1,7 @@
 Real-time betting, trading, and prediction market exchange for the next generation of investors.
 
+[Mainnet](https://bloxwap.com) | [Devnet](https://devnet.bloxwap.com) | [Hub](https://hub.bloxwap.com)
+
 <details>
 <summary>Careers</summary>
 
