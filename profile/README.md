@@ -4,6 +4,6 @@
     <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/bloxwap/.github/main/profile/assets/bloxwap-wordmark-black-greenx.svg">
     <img alt="Bloxwap" src="https://raw.githubusercontent.com/bloxwap/.github/main/profile/assets/bloxwap-wordmark-black-greenx.svg" width="320">
   </picture>
+  <br>
+  <strong>The easiest way to trade.</strong>
 </p>
-
-<p align="center"><strong>The easiest way to trade.</strong></p>
