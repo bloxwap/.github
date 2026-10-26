@@ -138,7 +138,7 @@ jobs:
           ARGS=""; for p in $SCAN_PATHS; do if [ -d "$p" ]; then ARGS="$ARGS -r $p"; else ARGS="$ARGS -L $p"; fi; done
           SOURCE=osv.dev-api
           # shellcheck disable=SC2086
-          osv-scanner scan source $CFG $ARGS --format json --output-file osv.json; rc=$?
+          osv-scanner scan source $CFG $ARGS --format json --output-file osv.json && rc=0 || rc=$?
           if [ "$rc" -gt 1 ]; then
             # API unreachable (osv-scanner already retried 4x). One fallback: download the DB for this run only.
             echo "::warning::osv.dev API unreachable (rc=$rc); falling back to a one-off OSV database download"
@@ -146,7 +146,7 @@ jobs:
             export OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$RUNNER_TEMP/osv-db"
             # shellcheck disable=SC2086
             osv-scanner scan source $CFG $ARGS --offline-vulnerabilities --download-offline-databases \
-              --format json --output-file osv.json; rc=$?
+              --format json --output-file osv.json && rc=0 || rc=$?
             rm -rf "$RUNNER_TEMP/osv-db"
           fi
           echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
@@ -193,7 +193,7 @@ jobs:
           set -uo pipefail
           # .gitleaksignore (historical fingerprints) and .gitleaks.toml (path allowlist) are picked up from the repo root
           gitleaks git --redact --no-banner --exit-code 1 --log-opts="--since=$DAYS.days" \
-            --report-format json --report-path "$RUNNER_TEMP/gitleaks.json" .; rc=$?
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks.json" . && rc=0 || rc=$?
           [ "$rc" -gt 1 ] && { echo "::error::gitleaks failed (rc=$rc)"; exit "$rc"; }
           NEW=$(jq 'length' "$RUNNER_TEMP/gitleaks.json" 2>/dev/null || echo 0)
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
@@ -208,10 +208,14 @@ jobs:
       - name: Dockerfile and IaC (trivy config; release profile)
         if: ${{ !cancelled() && inputs.profile == 'release' && inputs.iac }}
         shell: bash
-        run: trivy config --severity HIGH,CRITICAL --exit-code 1 --cache-dir "$RUNNER_TEMP/trivy-cache" .
+        run: |
+          # .trivyignore.yaml (path-scoped, expiring exceptions) is applied when the repo has one
+          IGN=(); [ -f .trivyignore.yaml ] && IGN=(--ignorefile .trivyignore.yaml)
+          trivy config --severity HIGH,CRITICAL --exit-code 1 --cache-dir "$RUNNER_TEMP/trivy-cache" ${IGN[@]+"${IGN[@]}"} .
 
       - name: Keep the OSV report (nightly only; adds nothing to the release critical path)
         if: ${{ always() && inputs.profile == 'nightly' }}
+        continue-on-error: true   # an artifact-storage quota or upload hiccup must not turn the scan red
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: osv
@@ -270,7 +274,7 @@ jobs:
           set -uo pipefail
           WINDOW="--since=$DAYS.days"; [ "$MODE" = full ] && WINDOW="HEAD"
           gitleaks git --redact --no-banner --exit-code 1 --log-opts="$WINDOW" \
-            --report-format json --report-path gitleaks.json .; rc=$?
+            --report-format json --report-path gitleaks.json . && rc=0 || rc=$?
           [ "$rc" -gt 1 ] && { echo "::error::gitleaks failed (rc=$rc)"; exit "$rc"; }
           NEW=$(jq 'length' gitleaks.json 2>/dev/null || echo 0)
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
@@ -280,6 +284,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
       - if: ${{ always() && inputs.upload-secret-report }}
+        continue-on-error: true   # an artifact-storage quota or upload hiccup must not turn the scan red
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: gitleaks-redacted
@@ -307,7 +312,10 @@ jobs:
           echo "$BIN" >> "$GITHUB_PATH"
       - name: Dockerfile and IaC (trivy config)
         shell: bash
-        run: trivy config --severity HIGH,CRITICAL --exit-code 1 --cache-dir "$RUNNER_TEMP/trivy-cache" .
+        run: |
+          # .trivyignore.yaml (path-scoped, expiring exceptions) is applied when the repo has one
+          IGN=(); [ -f .trivyignore.yaml ] && IGN=(--ignorefile .trivyignore.yaml)
+          trivy config --severity HIGH,CRITICAL --exit-code 1 --cache-dir "$RUNNER_TEMP/trivy-cache" ${IGN[@]+"${IGN[@]}"} .
 
   workflow-lint:
     if: inputs.profile == 'nightly' && inputs.workflow-lint

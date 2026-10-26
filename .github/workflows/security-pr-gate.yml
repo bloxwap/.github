@@ -58,12 +58,12 @@ jobs:
           LF=""; while IFS= read -r f; do [ -f "$f" ] && LF="$LF -L $f"; done < lockfiles.txt
           [ -z "$LF" ] && exit 0      # lockfiles were deleted, nothing to scan
           # shellcheck disable=SC2086
-          "$OSV" scan source $CFG $LF --format json --output-file osv.json; rc=$?
+          "$OSV" scan source $CFG $LF --format json --output-file osv.json && rc=0 || rc=$?
           if [ "$rc" -gt 1 ]; then
             echo "::warning::osv.dev API unreachable (rc=$rc); falling back to a one-off OSV database download"
             export OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$RUNNER_TEMP/osv-db"
             # shellcheck disable=SC2086
-            "$OSV" scan source $CFG $LF --offline-vulnerabilities --download-offline-databases --format json --output-file osv.json; rc=$?
+            "$OSV" scan source $CFG $LF --offline-vulnerabilities --download-offline-databases --format json --output-file osv.json && rc=0 || rc=$?
             rm -rf "$RUNNER_TEMP/osv-db"
           fi
           if [ "$rc" -gt 1 ]; then echo "::error::osv-scanner failed (rc=$rc)"; exit "$rc"; fi
