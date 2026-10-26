@@ -50,10 +50,37 @@ jobs:
           FLOOR: ${{ inputs.fail-cvss }}
         run: |
           set -uo pipefail
-          d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$OSV_SHA256"; mkdir -p "$d"
-          if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$OSV_URL" && mv -f "$d/pkg.$$" "$d/pkg"; fi
-          echo "$OSV_SHA256  $d/pkg" | shasum -a 256 -c - >/dev/null || { rm -f "$d/pkg"; exit 2; }
-          OSV="$RUNNER_TEMP/osv-scanner"; install -m 0755 "$d/pkg" "$OSV"
+          fetch() {   # fetch <url> <sha256> <tool> -> prints verified path
+            local url="$1" sha="$2" tool="$3" d tmp attempt delay
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$sha"
+            mkdir -p "$d" || return 2
+            if [ -f "$d/pkg" ] && echo "$sha  $d/pkg" | shasum -a 256 -c - >/dev/null 2>&1; then
+              echo "$d/pkg"
+              return 0
+            fi
+            rm -f "$d/pkg" || return 2
+            delay="${TOOL_DOWNLOAD_BACKOFF_SECONDS:-5}"
+            for attempt in 1 2 3 4; do
+              tmp=$(mktemp "$d/pkg.XXXXXX") || return 2
+              if curl -fsSL --retry 5 --retry-all-errors --retry-delay 0 --connect-timeout 20 --max-time 180 -o "$tmp" "$url" &&
+                 echo "$sha  $tmp" | shasum -a 256 -c - >/dev/null 2>&1; then
+                if mv -f "$tmp" "$d/pkg"; then
+                  echo "$d/pkg"
+                  return 0
+                fi
+              fi
+              rm -f "$tmp" || return 2
+              echo "::warning::$tool download or verification failed (attempt $attempt/4): $url" >&2
+              if [ "$attempt" -lt 4 ]; then
+                sleep "$delay"
+                delay=$((delay * 3))
+              fi
+            done
+            echo "::error::tool download failed for $tool after 4 attempts: $url" >&2
+            return 2
+          }
+          pkg=$(fetch "$OSV_URL" "$OSV_SHA256" osv-scanner) || exit 2
+          OSV="$RUNNER_TEMP/osv-scanner"; install -m 0755 "$pkg" "$OSV"
           CFG=""; [ -f osv-scanner.toml ] && CFG="--config=osv-scanner.toml"
           LF=""; while IFS= read -r f; do [ -f "$f" ] && LF="$LF -L $f"; done < lockfiles.txt
           [ -z "$LF" ] && exit 0      # lockfiles were deleted, nothing to scan
@@ -106,10 +133,38 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          BIN="$RUNNER_TEMP/scan-bin"; d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$GITLEAKS_SHA256"; mkdir -p "$BIN" "$d"
-          if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$GITLEAKS_URL" && mv -f "$d/pkg.$$" "$d/pkg"; fi
-          echo "$GITLEAKS_SHA256  $d/pkg" | shasum -a 256 -c - >/dev/null || { rm -f "$d/pkg"; exit 2; }
-          tar -xzf "$d/pkg" -C "$BIN" gitleaks
+          BIN="$RUNNER_TEMP/scan-bin"; mkdir -p "$BIN"
+          fetch() {   # fetch <url> <sha256> <tool> -> prints verified path
+            local url="$1" sha="$2" tool="$3" d tmp attempt delay
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$sha"
+            mkdir -p "$d" || return 2
+            if [ -f "$d/pkg" ] && echo "$sha  $d/pkg" | shasum -a 256 -c - >/dev/null 2>&1; then
+              echo "$d/pkg"
+              return 0
+            fi
+            rm -f "$d/pkg" || return 2
+            delay="${TOOL_DOWNLOAD_BACKOFF_SECONDS:-5}"
+            for attempt in 1 2 3 4; do
+              tmp=$(mktemp "$d/pkg.XXXXXX") || return 2
+              if curl -fsSL --retry 5 --retry-all-errors --retry-delay 0 --connect-timeout 20 --max-time 180 -o "$tmp" "$url" &&
+                 echo "$sha  $tmp" | shasum -a 256 -c - >/dev/null 2>&1; then
+                if mv -f "$tmp" "$d/pkg"; then
+                  echo "$d/pkg"
+                  return 0
+                fi
+              fi
+              rm -f "$tmp" || return 2
+              echo "::warning::$tool download or verification failed (attempt $attempt/4): $url" >&2
+              if [ "$attempt" -lt 4 ]; then
+                sleep "$delay"
+                delay=$((delay * 3))
+              fi
+            done
+            echo "::error::tool download failed for $tool after 4 attempts: $url" >&2
+            return 2
+          }
+          pkg=$(fetch "$GITLEAKS_URL" "$GITLEAKS_SHA256" gitleaks) || exit 2
+          tar -xzf "$pkg" -C "$BIN" gitleaks
           if echo "$BASE_SHA" | grep -qE '^0+$|^$'; then RANGE="HEAD~1..HEAD"; else RANGE="$(git merge-base "$BASE_SHA" HEAD)..HEAD"; fi
           # .gitleaksignore / .gitleaks.toml in the repo root are picked up automatically
           "$BIN/gitleaks" git --redact --no-banner --exit-code 1 --log-opts="$RANGE" .

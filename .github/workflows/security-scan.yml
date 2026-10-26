@@ -113,15 +113,45 @@ jobs:
         run: |
           set -euo pipefail
           BIN="$RUNNER_TEMP/scan-bin"; mkdir -p "$BIN"
-          fetch() {   # fetch <url> <sha256> -> prints verified path
-            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$2"; mkdir -p "$d"
-            if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$1" && mv -f "$d/pkg.$$" "$d/pkg"; fi
-            if ! echo "$2  $d/pkg" | shasum -a 256 -c - >/dev/null; then rm -f "$d/pkg"; echo "::error::checksum mismatch for $1" >&2; exit 2; fi
-            echo "$d/pkg"
+          fetch() {   # fetch <url> <sha256> <tool> -> prints verified path
+            local url="$1" sha="$2" tool="$3" d tmp attempt delay
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$sha"
+            mkdir -p "$d" || return 2
+            if [ -f "$d/pkg" ] && echo "$sha  $d/pkg" | shasum -a 256 -c - >/dev/null 2>&1; then
+              echo "$d/pkg"
+              return 0
+            fi
+            rm -f "$d/pkg" || return 2
+            delay="${TOOL_DOWNLOAD_BACKOFF_SECONDS:-5}"
+            for attempt in 1 2 3 4; do
+              tmp=$(mktemp "$d/pkg.XXXXXX") || return 2
+              if curl -fsSL --retry 5 --retry-all-errors --retry-delay 0 --connect-timeout 20 --max-time 180 -o "$tmp" "$url" &&
+                 echo "$sha  $tmp" | shasum -a 256 -c - >/dev/null 2>&1; then
+                if mv -f "$tmp" "$d/pkg"; then
+                  echo "$d/pkg"
+                  return 0
+                fi
+              fi
+              rm -f "$tmp" || return 2
+              echo "::warning::$tool download or verification failed (attempt $attempt/4): $url" >&2
+              if [ "$attempt" -lt 4 ]; then
+                sleep "$delay"
+                delay=$((delay * 3))
+              fi
+            done
+            echo "::error::tool download failed for $tool after 4 attempts: $url" >&2
+            return 2
           }
-          install -m 0755 "$(fetch "$OSV_URL" "$OSV_SHA256")" "$BIN/osv-scanner"
-          if [ "$WANT_GITLEAKS" = true ]; then tar -xzf "$(fetch "$GITLEAKS_URL" "$GITLEAKS_SHA256")" -C "$BIN" gitleaks; fi
-          if [ "$WANT_TRIVY" = true ]; then tar -xzf "$(fetch "$TRIVY_URL" "$TRIVY_SHA256")" -C "$BIN" trivy; fi
+          pkg=$(fetch "$OSV_URL" "$OSV_SHA256" osv-scanner) || exit 2
+          install -m 0755 "$pkg" "$BIN/osv-scanner"
+          if [ "$WANT_GITLEAKS" = true ]; then
+            pkg=$(fetch "$GITLEAKS_URL" "$GITLEAKS_SHA256" gitleaks) || exit 2
+            tar -xzf "$pkg" -C "$BIN" gitleaks
+          fi
+          if [ "$WANT_TRIVY" = true ]; then
+            pkg=$(fetch "$TRIVY_URL" "$TRIVY_SHA256" trivy) || exit 2
+            tar -xzf "$pkg" -C "$BIN" trivy
+          fi
           echo "$BIN" >> "$GITHUB_PATH"
 
       - name: Dependencies (osv.dev API, fail only on fixable CVSS >= floor)
@@ -259,10 +289,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BIN="$RUNNER_TEMP/scan-bin"; d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$GITLEAKS_SHA256"; mkdir -p "$BIN" "$d"
-          if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$GITLEAKS_URL" && mv -f "$d/pkg.$$" "$d/pkg"; fi
-          echo "$GITLEAKS_SHA256  $d/pkg" | shasum -a 256 -c - >/dev/null || { rm -f "$d/pkg"; exit 2; }
-          tar -xzf "$d/pkg" -C "$BIN" gitleaks
+          BIN="$RUNNER_TEMP/scan-bin"; mkdir -p "$BIN"
+          fetch() {   # fetch <url> <sha256> <tool> -> prints verified path
+            local url="$1" sha="$2" tool="$3" d tmp attempt delay
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$sha"
+            mkdir -p "$d" || return 2
+            if [ -f "$d/pkg" ] && echo "$sha  $d/pkg" | shasum -a 256 -c - >/dev/null 2>&1; then
+              echo "$d/pkg"
+              return 0
+            fi
+            rm -f "$d/pkg" || return 2
+            delay="${TOOL_DOWNLOAD_BACKOFF_SECONDS:-5}"
+            for attempt in 1 2 3 4; do
+              tmp=$(mktemp "$d/pkg.XXXXXX") || return 2
+              if curl -fsSL --retry 5 --retry-all-errors --retry-delay 0 --connect-timeout 20 --max-time 180 -o "$tmp" "$url" &&
+                 echo "$sha  $tmp" | shasum -a 256 -c - >/dev/null 2>&1; then
+                if mv -f "$tmp" "$d/pkg"; then
+                  echo "$d/pkg"
+                  return 0
+                fi
+              fi
+              rm -f "$tmp" || return 2
+              echo "::warning::$tool download or verification failed (attempt $attempt/4): $url" >&2
+              if [ "$attempt" -lt 4 ]; then
+                sleep "$delay"
+                delay=$((delay * 3))
+              fi
+            done
+            echo "::error::tool download failed for $tool after 4 attempts: $url" >&2
+            return 2
+          }
+          pkg=$(fetch "$GITLEAKS_URL" "$GITLEAKS_SHA256" gitleaks) || exit 2
+          tar -xzf "$pkg" -C "$BIN" gitleaks
           echo "$BIN" >> "$GITHUB_PATH"
       - name: Secrets (gitleaks, redacted)
         id: gl
@@ -305,10 +363,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BIN="$RUNNER_TEMP/scan-bin"; d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$TRIVY_SHA256"; mkdir -p "$BIN" "$d"
-          if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$TRIVY_URL" && mv -f "$d/pkg.$$" "$d/pkg"; fi
-          echo "$TRIVY_SHA256  $d/pkg" | shasum -a 256 -c - >/dev/null || { rm -f "$d/pkg"; exit 2; }
-          tar -xzf "$d/pkg" -C "$BIN" trivy
+          BIN="$RUNNER_TEMP/scan-bin"; mkdir -p "$BIN"
+          fetch() {   # fetch <url> <sha256> <tool> -> prints verified path
+            local url="$1" sha="$2" tool="$3" d tmp attempt delay
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$sha"
+            mkdir -p "$d" || return 2
+            if [ -f "$d/pkg" ] && echo "$sha  $d/pkg" | shasum -a 256 -c - >/dev/null 2>&1; then
+              echo "$d/pkg"
+              return 0
+            fi
+            rm -f "$d/pkg" || return 2
+            delay="${TOOL_DOWNLOAD_BACKOFF_SECONDS:-5}"
+            for attempt in 1 2 3 4; do
+              tmp=$(mktemp "$d/pkg.XXXXXX") || return 2
+              if curl -fsSL --retry 5 --retry-all-errors --retry-delay 0 --connect-timeout 20 --max-time 180 -o "$tmp" "$url" &&
+                 echo "$sha  $tmp" | shasum -a 256 -c - >/dev/null 2>&1; then
+                if mv -f "$tmp" "$d/pkg"; then
+                  echo "$d/pkg"
+                  return 0
+                fi
+              fi
+              rm -f "$tmp" || return 2
+              echo "::warning::$tool download or verification failed (attempt $attempt/4): $url" >&2
+              if [ "$attempt" -lt 4 ]; then
+                sleep "$delay"
+                delay=$((delay * 3))
+              fi
+            done
+            echo "::error::tool download failed for $tool after 4 attempts: $url" >&2
+            return 2
+          }
+          pkg=$(fetch "$TRIVY_URL" "$TRIVY_SHA256" trivy) || exit 2
+          tar -xzf "$pkg" -C "$BIN" trivy
           echo "$BIN" >> "$GITHUB_PATH"
       - name: Dockerfile and IaC (trivy config)
         shell: bash
@@ -328,20 +414,56 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github
       - name: Install actionlint + zizmor (tool cache, SHA256 verified)
+        id: lint-tools
         shell: bash
+        env:
+          ENFORCE: ${{ inputs.enforce-workflow-lint }}
         run: |
           set -euo pipefail
           BIN="$RUNNER_TEMP/scan-bin"; mkdir -p "$BIN"
+          fetch() {   # fetch <url> <sha256> <tool> -> prints verified path
+            local url="$1" sha="$2" tool="$3" d tmp attempt delay
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$sha"
+            mkdir -p "$d" || return 2
+            if [ -f "$d/pkg" ] && echo "$sha  $d/pkg" | shasum -a 256 -c - >/dev/null 2>&1; then
+              echo "$d/pkg"
+              return 0
+            fi
+            rm -f "$d/pkg" || return 2
+            delay="${TOOL_DOWNLOAD_BACKOFF_SECONDS:-5}"
+            for attempt in 1 2 3 4; do
+              tmp=$(mktemp "$d/pkg.XXXXXX") || return 2
+              if curl -fsSL --retry 5 --retry-all-errors --retry-delay 0 --connect-timeout 20 --max-time 180 -o "$tmp" "$url" &&
+                 echo "$sha  $tmp" | shasum -a 256 -c - >/dev/null 2>&1; then
+                if mv -f "$tmp" "$d/pkg"; then
+                  echo "$d/pkg"
+                  return 0
+                fi
+              fi
+              rm -f "$tmp" || return 2
+              echo "::warning::$tool download or verification failed (attempt $attempt/4): $url" >&2
+              if [ "$attempt" -lt 4 ]; then
+                sleep "$delay"
+                delay=$((delay * 3))
+              fi
+            done
+            echo "::error::tool download failed for $tool after 4 attempts: $url" >&2
+            return 2
+          }
           for t in "$ACTIONLINT_URL $ACTIONLINT_SHA256 actionlint" "$ZIZMOR_URL $ZIZMOR_SHA256 zizmor"; do
             # shellcheck disable=SC2086
             set -- $t   # url sha name
-            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$2"; mkdir -p "$d"
-            if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$1" && mv -f "$d/pkg.$$" "$d/pkg"; fi
-            echo "$2  $d/pkg" | shasum -a 256 -c - >/dev/null || { rm -f "$d/pkg"; exit 2; }
-            tar -xzf "$d/pkg" -C "$BIN" "$3"
+            if ! pkg=$(fetch "$1" "$2" "$3"); then
+              if [ "$ENFORCE" = true ]; then exit 2; fi
+              echo "::warning::workflow lint skipped: tool download failed"
+              exit 0
+            fi
+            tar -xzf "$pkg" -C "$BIN" "$3"
           done
           echo "$BIN" >> "$GITHUB_PATH"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
       - name: Workflow lint
+        if: steps.lint-tools.outputs.ready == 'true'
         shell: bash
         env:
           ENFORCE: ${{ inputs.enforce-workflow-lint }}
