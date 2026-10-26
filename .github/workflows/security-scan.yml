@@ -383,7 +383,11 @@ jobs:
           echo "### Result: $SUMMARY" >> "$GITHUB_STEP_SUMMARY"
           BAD=$(echo "$RESULTS" | jq '[.[] | select(. == "failure" or . == "cancelled")] | length')
           [ "$BAD" -eq 0 ] && exit 0
-          if [ "$NOTIFY" = true ] && [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+          if [ "$NOTIFY" != true ] || [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            echo "Slack skipped (notify-slack=$NOTIFY, event=$GITHUB_EVENT_NAME); the red check is the signal on PRs"
+          elif [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "::warning::SLACK_WEBHOOK_URL not set; skipping Slack"
+          else
             RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             TEXT=":warning: *Nightly security scan failed* in \`$GITHUB_REPOSITORY\` ($WORKFLOW)
           $SUMMARY
