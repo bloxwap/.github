@@ -1,0 +1,387 @@
+# bloxwap/.github -> .github/workflows/security-scan.yml  (reusable; bloxwap/.github is PUBLIC, so every repo can call it)
+#
+# profile: nightly  -> scanners run as separate parallel jobs; a final gate job posts to Slack on failure.
+# profile: release  -> ONE job (one runner slot): osv.dev deps + gitleaks over recent commits (+ trivy if iac).
+#                      Release/deploy jobs put this call in `needs:` so it runs in parallel with the build
+#                      and only gates the deploy. Slack is posted from the same job on failure.
+#
+# Dependencies: osv.dev API (fast, ~1-9 s per repo). If the API is unreachable (osv-scanner rc > 1 after its own
+# 4 retries) the job falls back ONCE to downloading the OSV database for this run only (no cache; needs the
+# network too, ~14-26 s). If both fail the job fails closed.
+# Fail rule: CVSS >= fail-cvss AND a fixed version exists. Everything else is reported in the job summary only.
+# Binaries are kept in the runner tool cache by SHA256 and re-verified on every run.
+name: security-scan
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON runner spec. Any Mac mini runner can run this.
+        type: string
+        default: '["self-hosted","macOS","ARM64"]'
+      profile:
+        description: nightly or release
+        type: string
+        default: nightly
+      deps:
+        type: boolean
+        default: true
+      deps-paths:
+        description: Space-separated paths. Directory = recursive scan, file = that lockfile.
+        type: string
+        default: "."
+      fail-cvss:
+        type: string
+        default: "7.0"
+      enforce:
+        description: false = report and notify, but never fail (use for the first week of a release gate)
+        type: boolean
+        default: true
+      secrets-scan:
+        type: boolean
+        default: true
+      secrets-mode:
+        description: incremental (last N days) or full (whole history). Release profile always uses incremental.
+        type: string
+        default: incremental
+      secrets-days:
+        type: string
+        default: "2"
+      iac:
+        type: boolean
+        default: false
+      workflow-lint:
+        description: nightly only
+        type: boolean
+        default: true
+      enforce-workflow-lint:
+        type: boolean
+        default: false
+      upload-sarif:
+        description: Public repos only (no GHAS on private repos).
+        type: boolean
+        default: false
+      upload-secret-report:
+        description: Redacted gitleaks JSON as an artifact. Keep false on public repos (artifacts are public there).
+        type: boolean
+        default: false
+      notify-slack:
+        type: boolean
+        default: true
+    secrets:
+      SLACK_WEBHOOK_URL:
+        description: bloxwap incoming webhook. Optional; without it the run only fails, it does not post.
+        required: false
+
+# No permissions block: jobs get exactly what the caller grants (contents: read).
+
+env:
+  OSV_URL: https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_darwin_arm64
+  OSV_SHA256: d4926ef8da134332543be276dff157e4c170f99ad91fc48e89448a8816bdf70b
+  GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_darwin_arm64.tar.gz
+  GITLEAKS_SHA256: b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
+  TRIVY_URL: https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_macOS-ARM64.tar.gz
+  TRIVY_SHA256: 11a9b6cd2752011b54f01ea4bd0dbfa9f0c41dc6538d5a3f9d23955f471bf4e5
+  ACTIONLINT_URL: https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_darwin_arm64.tar.gz
+  ACTIONLINT_SHA256: aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f
+  ZIZMOR_URL: https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-aarch64-apple-darwin.tar.gz
+  ZIZMOR_SHA256: ad5aa633cd56215b11e6c51d51f90c7e6b22904a75047d1215abbd422f61d698
+
+jobs:
+  scan:
+    # nightly: dependencies only. release: dependencies + secrets (+ IaC) in this one job.
+    if: inputs.deps || inputs.profile == 'release'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    outputs:
+      deps-fail: ${{ steps.deps.outputs.fail }}
+      deps-report: ${{ steps.deps.outputs.report }}
+      deps-source: ${{ steps.deps.outputs.source }}
+      secrets-new: ${{ steps.secrets.outputs.new }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # release: enough history for the gitleaks window. nightly: deps only need the tip.
+          fetch-depth: ${{ inputs.profile == 'release' && inputs.secrets-scan && 500 || 1 }}
+          persist-credentials: false
+
+      - name: Install scanners (tool cache, SHA256 verified every run)
+        shell: bash
+        env:
+          WANT_GITLEAKS: ${{ inputs.profile == 'release' && inputs.secrets-scan }}
+          WANT_TRIVY: ${{ inputs.profile == 'release' && inputs.iac }}
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/scan-bin"; mkdir -p "$BIN"
+          fetch() {   # fetch <url> <sha256> -> prints verified path
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$2"; mkdir -p "$d"
+            if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$1" && mv -f "$d/pkg.$$" "$d/pkg"; fi
+            if ! echo "$2  $d/pkg" | shasum -a 256 -c - >/dev/null; then rm -f "$d/pkg"; echo "::error::checksum mismatch for $1" >&2; exit 2; fi
+            echo "$d/pkg"
+          }
+          install -m 0755 "$(fetch "$OSV_URL" "$OSV_SHA256")" "$BIN/osv-scanner"
+          if [ "$WANT_GITLEAKS" = true ]; then tar -xzf "$(fetch "$GITLEAKS_URL" "$GITLEAKS_SHA256")" -C "$BIN" gitleaks; fi
+          if [ "$WANT_TRIVY" = true ]; then tar -xzf "$(fetch "$TRIVY_URL" "$TRIVY_SHA256")" -C "$BIN" trivy; fi
+          echo "$BIN" >> "$GITHUB_PATH"
+
+      - name: Dependencies (osv.dev API, fail only on fixable CVSS >= floor)
+        id: deps
+        if: inputs.deps
+        shell: bash
+        env:
+          FLOOR: ${{ inputs.fail-cvss }}
+          SCAN_PATHS: ${{ inputs.deps-paths }}
+          ENFORCE: ${{ inputs.enforce }}
+        run: |
+          set -uo pipefail
+          CFG=""; [ -f osv-scanner.toml ] && CFG="--config=osv-scanner.toml"
+          ARGS=""; for p in $SCAN_PATHS; do if [ -d "$p" ]; then ARGS="$ARGS -r $p"; else ARGS="$ARGS -L $p"; fi; done
+          SOURCE=osv.dev-api
+          # shellcheck disable=SC2086
+          osv-scanner scan source $CFG $ARGS --format json --output-file osv.json; rc=$?
+          if [ "$rc" -gt 1 ]; then
+            # API unreachable (osv-scanner already retried 4x). One fallback: download the DB for this run only.
+            echo "::warning::osv.dev API unreachable (rc=$rc); falling back to a one-off OSV database download"
+            SOURCE=osv-offline-db-fallback
+            export OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$RUNNER_TEMP/osv-db"
+            # shellcheck disable=SC2086
+            osv-scanner scan source $CFG $ARGS --offline-vulnerabilities --download-offline-databases \
+              --format json --output-file osv.json; rc=$?
+            rm -rf "$RUNNER_TEMP/osv-db"
+          fi
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -gt 1 ]; then echo "::error::osv-scanner could not reach osv.dev or its database (rc=$rc). Failing closed."; exit "$rc"; fi
+          cat > "$RUNNER_TEMP/osv-gate.jq" <<'JQ'
+          def vnum: [ (sub("^v";"") | split("+")[0] | split("-")[0] | split(".")[] | (tonumber? // 0)) ];
+          [ .results[]? | (.source.path | ltrimstr($root)) as $src | .packages[]? as $p
+            | select(($p.package.version // "") | test("^v?[0-9]"))
+            | $p.groups[]? as $g
+            | (($g.max_severity // "") | tonumber? // 0) as $sev
+            | [ $p.vulnerabilities[]? | select(.id as $i | $g.ids | index($i))
+                | .affected[]? | select(.package.name == $p.package.name and .package.ecosystem == $p.package.ecosystem)
+                | .ranges[]?.events[]? | .fixed // empty
+                | select(vnum > ($p.package.version | vnum)) ] as $fixes
+            | { source: $src, ecosystem: $p.package.ecosystem, package: $p.package.name,
+                version: $p.package.version, id: $g.ids[0], severity: $sev,
+                fixed: (($fixes | sort_by(vnum) | first) // null) } ]
+          | unique_by([.source, .package, .version, .id])
+          | { fail:        [ .[] | select(.severity >= ($min | tonumber) and .fixed != null) ],
+              report_only: [ .[] | select(.severity <  ($min | tonumber) or  .fixed == null) ] }
+          JQ
+          jq --arg min "$FLOOR" --arg root "$PWD/" -f "$RUNNER_TEMP/osv-gate.jq" osv.json > osv-gate.json || { echo "::error::could not parse osv output"; exit 2; }
+          FAIL=$(jq '.fail | length' osv-gate.json); REPORT=$(jq '.report_only | length' osv-gate.json)
+          echo "fail=$FAIL" >> "$GITHUB_OUTPUT"; echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Dependencies ($SOURCE): $FAIL fixable at CVSS >= $FLOOR, $REPORT report-only"
+            echo "| | Package | Installed | Advisory | CVSS | Fixed in | Lockfile |"
+            echo "|---|---|---|---|---|---|---|"
+            jq -r '(.fail[] | "| FAIL | \(.package) | \(.version) | \(.id) | \(.severity) | \(.fixed) | \(.source) |"),
+                   (.report_only[] | "| report | \(.package) | \(.version) | \(.id) | \(.severity) | \(.fixed // "no fix yet") | \(.source) |")' osv-gate.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FAIL" -gt 0 ] && [ "$ENFORCE" = true ]; then exit 1; fi
+          if [ "$FAIL" -gt 0 ]; then echo "::warning::$FAIL fixable High/Critical findings (enforce=false, not failing)"; fi
+          exit 0
+
+      - name: Secrets in recent commits (gitleaks, redacted; release profile)
+        id: secrets
+        if: ${{ !cancelled() && inputs.profile == 'release' && inputs.secrets-scan }}
+        shell: bash
+        env:
+          DAYS: ${{ inputs.secrets-days }}
+          ENFORCE: ${{ inputs.enforce }}
+        run: |
+          set -uo pipefail
+          # .gitleaksignore (historical fingerprints) and .gitleaks.toml (path allowlist) are picked up from the repo root
+          gitleaks git --redact --no-banner --exit-code 1 --log-opts="--since=$DAYS.days" \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks.json" .; rc=$?
+          [ "$rc" -gt 1 ] && { echo "::error::gitleaks failed (rc=$rc)"; exit "$rc"; }
+          NEW=$(jq 'length' "$RUNNER_TEMP/gitleaks.json" 2>/dev/null || echo 0)
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Secrets (last $DAYS days): $NEW new finding(s), values redacted"
+            jq -r '.[] | "- \(.RuleID) in \(.File):\(.StartLine) (commit \(.Commit[0:8]))"' "$RUNNER_TEMP/gitleaks.json" 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$RUNNER_TEMP/gitleaks.json"
+          if [ "$NEW" -gt 0 ] && [ "$ENFORCE" = true ]; then exit 1; fi
+          exit 0
+
+      - name: Dockerfile and IaC (trivy config; release profile)
+        if: ${{ !cancelled() && inputs.profile == 'release' && inputs.iac }}
+        shell: bash
+        run: trivy config --severity HIGH,CRITICAL --exit-code 1 --cache-dir "$RUNNER_TEMP/trivy-cache" .
+
+      - name: Keep the OSV report (nightly only; adds nothing to the release critical path)
+        if: ${{ always() && inputs.profile == 'nightly' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: osv
+          path: |
+            osv.json
+            osv-gate.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Notify Slack (release profile, failure only)
+        if: ${{ failure() && inputs.profile == 'release' && inputs.notify-slack }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DEPS_FAIL: ${{ steps.deps.outputs.fail }}
+          DEPS_SOURCE: ${{ steps.deps.outputs.source }}
+          SECRETS_NEW: ${{ steps.secrets.outputs.new }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -uo pipefail
+          [ -n "${SLACK_WEBHOOK_URL:-}" ] || { echo "::warning::SLACK_WEBHOOK_URL not set; skipping Slack"; exit 0; }
+          RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          TEXT=":rotating_light: *Release blocked by security scan* in \`$GITHUB_REPOSITORY\` ($WORKFLOW, $GITHUB_REF_NAME)
+          Fixable High/Critical deps: ${DEPS_FAIL:-n/a} (${DEPS_SOURCE:-n/a}) | New secrets: ${SECRETS_NEW:-n/a} (values redacted)
+          <$RUN|Open the run>"
+          jq -n --arg text "$TEXT" '{text: $text}' | curl -fsS --retry 2 -m 10 -H 'Content-Type: application/json' \
+            --data @- "$SLACK_WEBHOOK_URL" >/dev/null || echo "::warning::Slack post failed"
+
+  secrets:
+    if: inputs.profile == 'nightly' && inputs.secrets-scan
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 20
+    outputs:
+      new: ${{ steps.gl.outputs.new }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.secrets-mode != 'full' && 500 || 0 }}
+          persist-credentials: false
+      - name: Install gitleaks (tool cache, SHA256 verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/scan-bin"; d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$GITLEAKS_SHA256"; mkdir -p "$BIN" "$d"
+          if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$GITLEAKS_URL" && mv -f "$d/pkg.$$" "$d/pkg"; fi
+          echo "$GITLEAKS_SHA256  $d/pkg" | shasum -a 256 -c - >/dev/null || { rm -f "$d/pkg"; exit 2; }
+          tar -xzf "$d/pkg" -C "$BIN" gitleaks
+          echo "$BIN" >> "$GITHUB_PATH"
+      - name: Secrets (gitleaks, redacted)
+        id: gl
+        shell: bash
+        env:
+          MODE: ${{ inputs.secrets-mode }}
+          DAYS: ${{ inputs.secrets-days }}
+        run: |
+          set -uo pipefail
+          WINDOW="--since=$DAYS.days"; [ "$MODE" = full ] && WINDOW="HEAD"
+          gitleaks git --redact --no-banner --exit-code 1 --log-opts="$WINDOW" \
+            --report-format json --report-path gitleaks.json .; rc=$?
+          [ "$rc" -gt 1 ] && { echo "::error::gitleaks failed (rc=$rc)"; exit "$rc"; }
+          NEW=$(jq 'length' gitleaks.json 2>/dev/null || echo 0)
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Secrets ($MODE): $NEW finding(s) not in .gitleaksignore, values redacted"
+            jq -r '.[] | "- \(.RuleID) in \(.File):\(.StartLine) (commit \(.Commit[0:8]))"' gitleaks.json 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - if: ${{ always() && inputs.upload-secret-report }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: gitleaks-redacted
+          path: gitleaks.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  iac:
+    if: inputs.profile == 'nightly' && inputs.iac
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install trivy (tool cache, SHA256 verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/scan-bin"; d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$TRIVY_SHA256"; mkdir -p "$BIN" "$d"
+          if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$TRIVY_URL" && mv -f "$d/pkg.$$" "$d/pkg"; fi
+          echo "$TRIVY_SHA256  $d/pkg" | shasum -a 256 -c - >/dev/null || { rm -f "$d/pkg"; exit 2; }
+          tar -xzf "$d/pkg" -C "$BIN" trivy
+          echo "$BIN" >> "$GITHUB_PATH"
+      - name: Dockerfile and IaC (trivy config)
+        shell: bash
+        run: trivy config --severity HIGH,CRITICAL --exit-code 1 --cache-dir "$RUNNER_TEMP/trivy-cache" .
+
+  workflow-lint:
+    if: inputs.profile == 'nightly' && inputs.workflow-lint
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: Install actionlint + zizmor (tool cache, SHA256 verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/scan-bin"; mkdir -p "$BIN"
+          for t in "$ACTIONLINT_URL $ACTIONLINT_SHA256 actionlint" "$ZIZMOR_URL $ZIZMOR_SHA256 zizmor"; do
+            # shellcheck disable=SC2086
+            set -- $t   # url sha name
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$2"; mkdir -p "$d"
+            if [ ! -f "$d/pkg" ]; then curl -fsSL --retry 3 -o "$d/pkg.$$" "$1" && mv -f "$d/pkg.$$" "$d/pkg"; fi
+            echo "$2  $d/pkg" | shasum -a 256 -c - >/dev/null || { rm -f "$d/pkg"; exit 2; }
+            tar -xzf "$d/pkg" -C "$BIN" "$3"
+          done
+          echo "$BIN" >> "$GITHUB_PATH"
+      - name: Workflow lint
+        shell: bash
+        env:
+          ENFORCE: ${{ inputs.enforce-workflow-lint }}
+        run: |
+          set -uo pipefail
+          zizmor --offline --format sarif .github/workflows > zizmor.sarif || true
+          rc=0
+          actionlint || rc=1
+          zizmor --offline --min-severity medium .github/workflows || rc=1
+          if [ "$ENFORCE" != true ] && [ "$rc" -ne 0 ]; then echo "::warning::workflow lint findings (report-only)"; exit 0; fi
+          exit "$rc"
+      - if: always() && inputs.upload-sarif && hashFiles('zizmor.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+  gate:
+    # Nightly only: one result for the whole scan, and the Slack post on failure.
+    needs: [scan, secrets, iac, workflow-lint]
+    if: always() && inputs.profile == 'nightly'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - name: Gate and notify Slack on failure
+        shell: bash
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+          SUMMARY: deps=${{ needs.scan.result }} secrets=${{ needs.secrets.result }} iac=${{ needs.iac.result }} workflow-lint=${{ needs.workflow-lint.result }}
+          DEPS_FAIL: ${{ needs.scan.outputs.deps-fail }}
+          DEPS_REPORT: ${{ needs.scan.outputs.deps-report }}
+          DEPS_SOURCE: ${{ needs.scan.outputs.deps-source }}
+          SECRETS_NEW: ${{ needs.secrets.outputs.new }}
+          NOTIFY: ${{ inputs.notify-slack }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -uo pipefail
+          echo "### Result: $SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          BAD=$(echo "$RESULTS" | jq '[.[] | select(. == "failure" or . == "cancelled")] | length')
+          [ "$BAD" -eq 0 ] && exit 0
+          if [ "$NOTIFY" = true ] && [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            TEXT=":warning: *Nightly security scan failed* in \`$GITHUB_REPOSITORY\` ($WORKFLOW)
+          $SUMMARY
+          Fixable High/Critical deps: ${DEPS_FAIL:-n/a} (${DEPS_SOURCE:-n/a}), report-only: ${DEPS_REPORT:-n/a} | New secrets: ${SECRETS_NEW:-n/a} (values redacted)
+          <$RUN|Open the run>"
+            jq -n --arg text "$TEXT" '{text: $text}' | curl -fsS --retry 2 -m 10 -H 'Content-Type: application/json' \
+              --data @- "$SLACK_WEBHOOK_URL" >/dev/null || echo "::warning::Slack post failed"
+          fi
+          exit 1

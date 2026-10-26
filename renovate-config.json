@@ -1,0 +1,50 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "bloxwap shared Renovate preset (lives at bloxwap/.github/renovate-config.json). Repos opt in with: \"extends\": [\"local>bloxwap/.github:renovate-config\"]. Uses osv.dev data via Renovate, never Dependabot or GitHub vulnerability alerts.",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommitsDisabled"
+  ],
+  "timezone": "America/Los_Angeles",
+  "osvVulnerabilityAlerts": true,
+  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
+  "vulnerabilityAlerts": {
+    "labels": [
+      "dependencies",
+      "security-fix"
+    ]
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on monday"
+    ],
+    "commitMessageAction": "Refresh lockfile (picks up fixed transitive deps)"
+  },
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "labels": [
+    "dependencies"
+  ],
+  "packageRules": [
+    {
+      "description": "Group routine minor/patch updates weekly to keep PR noise down",
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "minor and patch updates",
+      "schedule": [
+        "before 6am on monday"
+      ]
+    },
+    {
+      "description": "Keep GitHub Actions pinned to SHAs",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "pinDigests": true
+    }
+  ]
+}
