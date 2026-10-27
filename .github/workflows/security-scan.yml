@@ -1,6 +1,8 @@
 # bloxwap/.github -> .github/workflows/security-scan.yml  (reusable; bloxwap/.github is PUBLIC, so every repo can call it)
 #
 # profile: nightly  -> scanners run as separate parallel jobs; a final gate job posts to Slack on failure.
+# semgrep: true     -> weekly report-only SAST job (separate caller, own schedule); results in the job summary,
+#                      Slack only when there are High (ERROR) findings. Not part of the gate.
 # profile: release  -> ONE job (one runner slot): osv.dev deps + gitleaks over recent commits (+ trivy if iac).
 #                      Release/deploy jobs put this call in `needs:` so it runs in parallel with the build
 #                      and only gates the deploy. Slack is posted from the same job on failure.
@@ -68,6 +70,14 @@ on:
       notify-slack:
         type: boolean
         default: true
+      semgrep:
+        description: Weekly SAST (semgrep). Report-only. It never fails the run and never gates a release. Slack only for High (ERROR) findings.
+        type: boolean
+        default: false
+      semgrep-config:
+        description: Semgrep ruleset(s), space-separated (registry packs or paths in the repo)
+        type: string
+        default: p/default
     secrets:
       SLACK_WEBHOOK_URL:
         description: bloxwap incoming webhook. Optional; without it the run only fails, it does not post.
@@ -86,6 +96,9 @@ env:
   ACTIONLINT_SHA256: aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f
   ZIZMOR_URL: https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-aarch64-apple-darwin.tar.gz
   ZIZMOR_SHA256: ad5aa633cd56215b11e6c51d51f90c7e6b22904a75047d1215abbd422f61d698
+  UV_URL: https://github.com/astral-sh/uv/releases/download/0.13.6/uv-aarch64-apple-darwin.tar.gz
+  UV_SHA256: 60fbd5c8a1ed681845eea28d9d622fcde03c51e91a43465b64a1e17db1ed3472
+  SEMGREP_VERSION: "1.182.1"
 
 jobs:
   scan:
@@ -481,10 +494,123 @@ jobs:
           sarif_file: zizmor.sarif
           category: zizmor
 
+  semgrep:
+    # Weekly SAST, report-only: the job is continue-on-error, every step exits 0, and the gate does not need it.
+    if: inputs.semgrep
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install uv (tool cache, SHA256 verified)
+        id: sg-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/scan-bin"; mkdir -p "$BIN"
+          fetch() {   # fetch <url> <sha256> <tool> -> prints verified path
+            local url="$1" sha="$2" tool="$3" d tmp attempt delay
+            d="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/bloxwap-scan/$sha"
+            mkdir -p "$d" || return 2
+            if [ -f "$d/pkg" ] && echo "$sha  $d/pkg" | shasum -a 256 -c - >/dev/null 2>&1; then
+              echo "$d/pkg"
+              return 0
+            fi
+            rm -f "$d/pkg" || return 2
+            delay="${TOOL_DOWNLOAD_BACKOFF_SECONDS:-5}"
+            for attempt in 1 2 3 4; do
+              tmp=$(mktemp "$d/pkg.XXXXXX") || return 2
+              if curl -fsSL --retry 5 --retry-all-errors --retry-delay 0 --connect-timeout 20 --max-time 180 -o "$tmp" "$url" &&
+                 echo "$sha  $tmp" | shasum -a 256 -c - >/dev/null 2>&1; then
+                if mv -f "$tmp" "$d/pkg"; then
+                  echo "$d/pkg"
+                  return 0
+                fi
+              fi
+              rm -f "$tmp" || return 2
+              echo "::warning::$tool download or verification failed (attempt $attempt/4): $url" >&2
+              if [ "$attempt" -lt 4 ]; then
+                sleep "$delay"
+                delay=$((delay * 3))
+              fi
+            done
+            echo "::error::tool download failed for $tool after 4 attempts: $url" >&2
+            return 2
+          }
+          if ! pkg=$(fetch "$UV_URL" "$UV_SHA256" uv); then
+            echo "::warning::semgrep skipped: uv download failed (report-only)"
+            exit 0
+          fi
+          tar -xzf "$pkg" -C "$BIN" --strip-components 1 uv-aarch64-apple-darwin/uv
+          echo "$BIN" >> "$GITHUB_PATH"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Semgrep (report-only)
+        id: sg
+        if: steps.sg-tools.outputs.ready == 'true'
+        shell: bash
+        env:
+          CONFIGS: ${{ inputs.semgrep-config }}
+          UV_CACHE_DIR: ${{ runner.tool_cache }}/bloxwap-scan/uv-cache
+          UV_PYTHON_INSTALL_DIR: ${{ runner.tool_cache }}/bloxwap-scan/uv-python
+          SEMGREP_SEND_METRICS: "off"
+          SEMGREP_ENABLE_VERSION_CHECK: "0"
+        run: |
+          set -uo pipefail
+          CFG=(); for c in $CONFIGS; do CFG+=(--config "$c"); done
+          start=$(date +%s)
+          uv tool run --python 3.12 --from "semgrep==$SEMGREP_VERSION" semgrep scan "${CFG[@]}" \
+            --metrics=off --disable-version-check --json --output "$RUNNER_TEMP/semgrep.json" --timeout 30 --quiet . && rc=0 || rc=$?
+          secs=$(( $(date +%s) - start ))
+          if [ ! -s "$RUNNER_TEMP/semgrep.json" ] || ! jq -e '.results' "$RUNNER_TEMP/semgrep.json" >/dev/null 2>&1; then
+            echo "::warning::semgrep did not produce a report (rc=$rc); report-only, not failing"
+            echo "### Semgrep: no report (rc=$rc)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          J="$RUNNER_TEMP/semgrep.json"
+          HIGH=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' "$J")
+          MED=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' "$J")
+          LOW=$(jq '[.results[] | select(.extra.severity != "ERROR" and .extra.severity != "WARNING")] | length' "$J")
+          ERRS=$(jq '.errors | length' "$J")
+          { echo "high=$HIGH"; echo "medium=$MED"; echo "low=$LOW"; } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Semgrep ($CONFIGS, ${secs}s): $HIGH High, $MED Medium, $LOW Low (report-only; $ERRS scan errors)"
+            if [ $((HIGH + MED)) -gt 0 ]; then
+              echo "| Severity | Rule | Location | Message |"
+              echo "|---|---|---|---|"
+              # No matched source lines in the summary: they could contain secrets.
+              jq -r '[.results[] | select(.extra.severity == "ERROR" or .extra.severity == "WARNING")]
+                     | sort_by(if .extra.severity == "ERROR" then 0 else 1 end) | .[0:100][]
+                     | "| \(if .extra.severity == "ERROR" then "High" else "Medium" end) | \(.check_id | split(".") | last) | \(.path):\(.start.line) | \(.extra.message | gsub("[\\n|]"; " ") | .[0:160]) |"' "$J"
+              [ $((HIGH + MED)) -gt 100 ] && echo "_Showing the first 100._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$J"
+          exit 0
+      - name: Notify Slack (High findings only, not on PRs)
+        if: ${{ steps.sg.outputs.high > 0 && inputs.notify-slack && github.event_name != 'pull_request' }}
+        shell: bash
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          HIGH: ${{ steps.sg.outputs.high }}
+          MED: ${{ steps.sg.outputs.medium }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -uo pipefail
+          [ -n "${SLACK_WEBHOOK_URL:-}" ] || { echo "::warning::SLACK_WEBHOOK_URL not set; skipping Slack"; exit 0; }
+          RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          TEXT=":mag: *Weekly Semgrep: $HIGH High finding(s)* in \`$GITHUB_REPOSITORY\` ($WORKFLOW). Report-only, nothing is blocked. Medium: ${MED:-0}
+          <$RUN|Open the run summary>"
+          jq -n --arg text "$TEXT" '{text: $text}' | curl -fsS --retry 2 -m 10 -H 'Content-Type: application/json' \
+            --data @- "$SLACK_WEBHOOK_URL" >/dev/null || echo "::warning::Slack post failed"
+          exit 0
+
   gate:
-    # Nightly only: one result for the whole scan, and the Slack post on failure.
+    # Nightly only: one result for the whole scan, and the Slack post on failure. Semgrep is not part of it.
     needs: [scan, secrets, iac, workflow-lint]
-    if: always() && inputs.profile == 'nightly'
+    if: always() && inputs.profile == 'nightly' && (inputs.deps || inputs.secrets-scan || inputs.iac || inputs.workflow-lint)
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
     steps:
