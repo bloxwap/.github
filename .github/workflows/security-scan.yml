@@ -290,14 +290,63 @@ jobs:
   secrets:
     if: inputs.profile == 'nightly' && inputs.secrets-scan
     runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     outputs:
       new: ${{ steps.gl.outputs.new }}
     steps:
+      # Self-hosted workspaces are reused. A prior job (including this workflow's
+      # own workflow-lint sparse checkout, which uses --filter=blob:none, or any
+      # other filter: checkout) can leave a partial clone (remote.origin.promisor
+      # / partialclonefilter). checkout with fetch-depth: 0 only runs
+      # `git fetch --unshallow` and does not clear that filter.
+      # persist-credentials is false, so when gitleaks later walks history, git
+      # cannot lazy-fetch missing objects ("could not fetch … from promisor
+      # remote") and still exits 0 with "N commits scanned" far below history
+      # and "no leaks found". Observed 2026-11-22: monorepo 1/5134, taptradetv
+      # 5/330, tapsiren 5/504, memory 0/68.
+      # Purging the leftover .git forces a clean, unfiltered clone. This job is
+      # nightly-only and is not on the release/deploy critical path.
+      - name: Purge leftover checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -e "$GITHUB_WORKSPACE/.git" ]; then
+            echo "Purging leftover git workspace at $GITHUB_WORKSPACE to force a clean clone"
+            find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          else
+            echo "No leftover .git at $GITHUB_WORKSPACE"
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: ${{ inputs.secrets-mode != 'full' && 500 || 0 }}
           persist-credentials: false
+          clean: true
+      - name: Assert unfiltered git history
+        shell: bash
+        env:
+          MODE: ${{ inputs.secrets-mode }}
+          DAYS: ${{ inputs.secrets-days }}
+        run: |
+          set -euo pipefail
+          promisor=$(git config --get remote.origin.promisor || true)
+          pfilter=$(git config --get remote.origin.partialclonefilter || true)
+          shallow=$(git rev-parse --is-shallow-repository)
+          if [ "$MODE" = full ]; then
+            expected=$(git rev-list --count HEAD)
+            expected_all=$(git rev-list --all --count)
+            echo "rev-list --count HEAD=$expected  --all=$expected_all  shallow=$shallow  promisor=${promisor:-none}  filter=${pfilter:-none}"
+          else
+            expected=$(git rev-list --count HEAD --since="$DAYS.days")
+            echo "rev-list --count HEAD --since=${DAYS}.days=$expected  shallow=$shallow  promisor=${promisor:-none}  filter=${pfilter:-none}"
+          fi
+          if [ -n "$promisor" ] || [ -n "$pfilter" ]; then
+            echo "::error::secrets workspace is still a partial clone (promisor=${promisor:-} filter=${pfilter:-}). Refusing to report a clean scan."
+            exit 1
+          fi
+          if [ "$MODE" = full ] && [ "$shallow" = true ]; then
+            echo "::error::secrets-mode=full but the workspace is still a shallow clone."
+            exit 1
+          fi
       - name: Install gitleaks (tool cache, SHA256 verified)
         shell: bash
         run: |
@@ -344,9 +393,33 @@ jobs:
         run: |
           set -uo pipefail
           WINDOW="--since=$DAYS.days"; [ "$MODE" = full ] && WINDOW="HEAD"
+          if [ "$MODE" = full ]; then
+            EXPECTED=$(git rev-list --count HEAD)
+          else
+            EXPECTED=$(git rev-list --count HEAD --since="$DAYS.days")
+          fi
+          LOG="$RUNNER_TEMP/gitleaks.out"
+          set +e
           gitleaks git --redact --no-banner --exit-code 1 --log-opts="$WINDOW" \
-            --report-format json --report-path gitleaks.json . && rc=0 || rc=$?
+            --report-format json --report-path gitleaks.json . >"$LOG" 2>&1
+          rc=$?
+          set -e
+          cat "$LOG"
+          SCANNED=$(sed $'s/\x1b\\[[0-9;]*[mK]//g' "$LOG" | grep -oE '[0-9]+ commits scanned' | awk '{print $1}' | tail -n 1)
+          echo "gitleaks scanned ${SCANNED:-unknown} commits; git rev-list expected $EXPECTED ($MODE)"
+          {
+            echo "### Secrets coverage ($MODE): scanned ${SCANNED:-unknown} / expected $EXPECTED commits"
+          } >> "$GITHUB_STEP_SUMMARY"
           [ "$rc" -gt 1 ] && { echo "::error::gitleaks failed (rc=$rc)"; exit "$rc"; }
+          if [ -z "${SCANNED:-}" ]; then
+            echo "::error::could not parse gitleaks scanned commit count; refusing to pass."
+            exit 1
+          fi
+          # Fail if scanned is under 80% of expected (catches 1-vs-thousands and 0-vs-68).
+          if [ "$EXPECTED" -gt 0 ] && [ "$SCANNED" -lt $(( EXPECTED * 8 / 10 )) ]; then
+            echo "::error::gitleaks scanned $SCANNED commits, but git rev-list reports $EXPECTED. History is incomplete; refusing to pass a clean scan."
+            exit 1
+          fi
           NEW=$(jq 'length' gitleaks.json 2>/dev/null || echo 0)
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
           {
